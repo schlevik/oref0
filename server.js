@@ -60,8 +60,7 @@ class PatientDataManager {
             profile: profile,
             history: {
                 glucose: initialData.glucoseHistory || [],
-                pump: initialData.pumpHistory || [],
-                carbs: initialData.carbHistory || []
+                pump: initialData.pumpHistory || []
             },
             currentState: {
                 tempBasal: initialData.currentTempBasal || null,
@@ -89,11 +88,8 @@ class PatientDataManager {
         // Sort glucose by date (newest first)
         patient.history.glucose.sort((a, b) => b.date - a.date);
 
-        // Sort pump events by timestamp (newest first) 
+        // Sort pump events by timestamp (newest first)
         patient.history.pump.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-
-        // Sort carbs by timestamp (newest first)
-        patient.history.carbs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
     }
 
     static patientExists(patientId) {
@@ -122,29 +118,41 @@ class PatientDataManager {
         }
 
         // Add insulin bolus events to pump history (matching Oref0.ts lines 180-189)
-        if (newData.bolus && newData.bolus > 0) {
-            const timestamp = newData.timestamp || new Date().toISOString();
-            patient.history.pump.push({
-                _type: "Bolus",
-                timestamp: timestamp,
-                amount: newData.bolus,
-                insulin: newData.bolus,
-                date: new Date(timestamp),
-                dateString: timestamp,
-                started_at: new Date(timestamp),
-                duration: 0
+        if (newData.bolusEntries && Array.isArray(newData.bolusEntries)) {
+            newData.bolusEntries.forEach(bolus => {
+                if (!bolus.timestamp) {
+                    throw new Error('Bolus entry missing required timestamp field');
+                }
+                if (!bolus.bolus && bolus.bolus !== 0) {
+                    throw new Error('Bolus entry missing required bolus field');
+                }
+                const bolusDate = new Date(bolus.timestamp);
+                patient.history.pump.push({
+                    _type: "Bolus",
+                    timestamp: bolus.timestamp,
+                    amount: bolus.bolus,
+                    insulin: bolus.bolus,
+                    date: bolusDate,
+                    dateString: bolus.timestamp,
+                    started_at: bolusDate
+                });
             });
         }
 
         // Add carb events to pump history (matching Oref0.ts lines 197-204)
         if (newData.carbEntries && Array.isArray(newData.carbEntries)) {
             newData.carbEntries.forEach(carb => {
+                if (!carb.timestamp) {
+                    throw new Error('Carb entry missing required timestamp field');
+                }
+                if (!carb.carbs && carb.carbs !== 0) {
+                    throw new Error('Carb entry missing required carbs field');
+                }
                 patient.history.pump.push({
                     _type: "carbs",
                     timestamp: carb.timestamp,
                     carbs: carb.carbs,
-                    nsCarbs: carb.carbs,
-                    enteredBy: carb.enteredBy || "patient"
+                    nsCarbs: carb.carbs
                 });
             });
         }
@@ -171,8 +179,7 @@ class PatientDataManager {
 
         // if no history retention settings, skip cleanup
         if (patient.history.glucose.length === 0 &&
-            patient.history.pump.length === 0 &&
-            patient.history.carbs.length === 0) return;
+            patient.history.pump.length === 0) return;
 
         // Find the newest timestamp from all data sources
         let newestTime = 0;
@@ -188,13 +195,7 @@ class PatientDataManager {
             const newestPump = Math.max(...patient.history.pump.map(p => new Date(p.timestamp).getTime()));
             newestTime = Math.max(newestTime, newestPump);
         }
-        
-        // Check carb history
-        if (patient.history.carbs.length > 0) {
-            const newestCarb = Math.max(...patient.history.carbs.map(c => new Date(c.timestamp).getTime()));
-            newestTime = Math.max(newestTime, newestCarb);
-        }
-        
+
         // If no data exists, skip cleanup
         if (newestTime === 0 || isNaN(newestTime)) return;
 
@@ -231,22 +232,13 @@ class PatientDataManager {
             new Date(p.timestamp).getTime() >= cutoffTime
         );
 
-        // Clean carb history
-        const beforeCarbs = patient.history.carbs.length;
-        patient.history.carbs = patient.history.carbs.filter(c =>
-            new Date(c.timestamp).getTime() >= cutoffTime
-        );
-
-
-        if (beforeGlucose == patient.history.glucose.length&&
-            beforePump == patient.history.pump.length &&
-            beforeCarbs == patient.history.carbs.length) {
+        if (beforeGlucose == patient.history.glucose.length &&
+            beforePump == patient.history.pump.length) {
             return;
         }
         console.log(`Cleaned up data older than ${retentionValue} ${retentionPeriod} from newest data point for patient ${patientId}.` +
                     ` Removed: ${beforeGlucose - patient.history.glucose.length} glucose,` +
-                    ` ${beforePump - patient.history.pump.length} pump,` +
-                    ` ${beforeCarbs - patient.history.carbs.length} carb entries`);
+                    ` ${beforePump - patient.history.pump.length} pump entries`);
     }
 
 
@@ -271,8 +263,7 @@ class PatientDataManager {
             currentIIR: patient.IIR,  // Include current Insulin Infusion Rate
             historyCount: {
                 glucose: patient.history.glucose.length,
-                pump: patient.history.pump.length,
-                carbs: patient.history.carbs.length
+                pump: patient.history.pump.length
             },
             createdAt: patient.createdAt,
             lastUpdated: patient.lastUpdated
@@ -556,12 +547,6 @@ app.get('/patients/:patientId/history', (req, res) => {
         if (type === 'all' || type === 'pump') {
             result.pump = patient.history.pump
                 .filter(p => new Date(p.timestamp).getTime() >= cutoffTime)
-                .slice(0, limit);
-        }
-
-        if (type === 'all' || type === 'carbs') {
-            result.carbs = patient.history.carbs
-                .filter(c => new Date(c.timestamp).getTime() >= cutoffTime)
                 .slice(0, limit);
         }
 
