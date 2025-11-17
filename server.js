@@ -1,7 +1,5 @@
 const express = require('express');
 const app = express();
-const fs = require('fs');
-const path = require('path');
 
 // Library imports - same as the CLI tools use
 const generateIOB = require('./lib/iob');
@@ -56,10 +54,16 @@ class PatientDataManager {
             autoCleanup: false
         };
 
+        // Ensure glucose history has required fields for COB calculations
+        const glucoseHistory = (initialData.glucoseHistory || []).map(reading => ({
+            ...reading,
+            dateString: reading.dateString || reading.timestamp || new Date(reading.date).toISOString()
+        }));
+
         patients[patientId] = {
             profile: profile,
             history: {
-                glucose: initialData.glucoseHistory || [],
+                glucose: glucoseHistory,
                 pump: initialData.pumpHistory || []
             },
             currentState: {
@@ -109,11 +113,26 @@ class PatientDataManager {
         if (!patient) throw new Error('Patient not found');
         // Add new glucose readings
         if (newData.glucoseReadings && Array.isArray(newData.glucoseReadings)) {
-            const renamedReadings = newData.glucoseReadings.map(reading => ({
-                ...reading,
-                dateString: reading.timestamp,
-                // timestamp: undefined
-            }));
+            // Validate each reading has required fields
+            newData.glucoseReadings.forEach((reading, idx) => {
+                if (!reading.timestamp) {
+                    throw new Error(`Glucose reading at index ${idx} missing required timestamp field`);
+                }
+                if (!reading.glucose && reading.glucose !== 0) {
+                    throw new Error(`Glucose reading at index ${idx} missing required glucose field`);
+                }
+                if (!reading.date) {
+                    throw new Error(`Glucose reading at index ${idx} missing required date field (milliseconds timestamp)`);
+                }
+            });
+
+            const renamedReadings = newData.glucoseReadings.map(reading => {
+                const timestamp = reading.timestamp || new Date(reading.date).toISOString();
+                return {
+                    ...reading,
+                    dateString: reading.dateString || timestamp
+                };
+            });
             patient.history.glucose.push(...renamedReadings);
         }
 
@@ -305,23 +324,46 @@ function calculateMealForPatient(patientId, clock) {
         profile: patient.profile,
         pumphistory: patient.history.pump,  // Same as treatments for compatibility
         glucose: patient.history.glucose,
-        basalprofile: {
+        basalprofile: patient.profile.basalprofile || {
             basals: [
-                { minutes: 0, rate: 1 }  // Default from Oref0.ts line 269
+                { minutes: 0, rate: patient.current_basal || 1 }  // Use current_basal as fallback
             ]
         }
     };
 
     // Call getMealData with opts and clock (matching Oref0.ts line 274)
-    const meal_data = getMealData(opts, clock);
+    try {
+        const meal_data = getMealData(opts, clock);
 
-    // Check for sufficient glucose data
-    if (patient.history.glucose.length < 36) {
-        meal_data.mealCOB = 0;
-        meal_data.reason = "not enough glucose data to calculate carb absorption";
+        // If mealCOB is NaN, return safe default
+        if (isNaN(meal_data.mealCOB)) {
+            console.error('Warning: mealCOB calculation returned NaN, returning zero COB');
+            return {
+                carbs: meal_data.carbs || 0,
+                mealCOB: 0,
+                reason: "COB calculation error - returned NaN",
+                currentDeviation: 0,
+                maxDeviation: 0,
+                minDeviation: 0,
+                slopeFromMaxDeviation: 0,
+                slopeFromMinDeviation: 0
+            };
+        }
+
+        return meal_data;
+    } catch (error) {
+        console.error('Error in getMealData:', error.message);
+        return {
+            carbs: 0,
+            mealCOB: 0,
+            reason: `Error calculating COB: ${error.message}`,
+            currentDeviation: 0,
+            maxDeviation: 0,
+            minDeviation: 0,
+            slopeFromMaxDeviation: 0,
+            slopeFromMinDeviation: 0
+        };
     }
-
-    return meal_data;
 }
 
 function calculateBasalForPatient(patientId, currentTime, options = {}) {
@@ -445,6 +487,53 @@ app.post('/patients/:patientId/initialize', (req, res) => {
             return res.status(400).json({ error: 'Profile is required' });
         }
 
+        // Validate required profile fields for COB calculations
+        const requiredFields = ['carb_ratio', 'dia', 'current_basal'];
+        const missingFields = requiredFields.filter(field => !profile[field] && profile[field] !== 0);
+        if (missingFields.length > 0) {
+            return res.status(400).json({
+                error: 'Missing required profile fields',
+                missingFields: missingFields
+            });
+        }
+
+        // Validate ISF (can be either simple 'sens' or 'isfProfile')
+        if (!profile.sens && !profile.isfProfile) {
+            return res.status(400).json({
+                error: 'Profile must have either "sens" or "isfProfile" field for insulin sensitivity'
+            });
+        }
+
+        // Convert simple 'sens' to 'isfProfile' structure if needed
+        if (profile.sens && !profile.isfProfile) {
+            profile.isfProfile = {
+                sensitivities: [
+                    {
+                        i: 0,
+                        start: "00:00:00",
+                        sensitivity: profile.sens,
+                        offset: 0,
+                        x: 0
+                    }
+                ]
+            };
+            console.log(`Converted simple sens (${profile.sens}) to isfProfile for patient ${patientId}`);
+        }
+
+        // Validate min_5m_carbimpact is provided (used in COB calculations)
+        if (!profile.min_5m_carbimpact && profile.min_5m_carbimpact !== 0) {
+            return res.status(400).json({
+                error: 'Profile must include "min_5m_carbimpact" field (mg/dL per 5 minutes for carb impact)'
+            });
+        }
+
+        // Validate maxCOB is provided
+        if (!profile.maxCOB && profile.maxCOB !== 0) {
+            return res.status(400).json({
+                error: 'Profile must include "maxCOB" field (maximum carbs on board in grams)'
+            });
+        }
+
         // Create or recreate patient
         const patient = PatientDataManager.createPatient(patientId, profile, initialData, settings);
 
@@ -461,49 +550,49 @@ app.post('/patients/:patientId/initialize', (req, res) => {
 
 // 2. Calculate Basal
 app.post('/patients/:patientId/calculate', (req, res) => {
-    //   try {
-    const { patientId, glucose } = req.params;
-    const { currentTime, newData = {}, options = {} } = req.body;
-    if (!PatientDataManager.patientExists(patientId)) {
-        return res.status(404).json({ error: 'Patient not found' });
-    }
+    try {
+        const { patientId } = req.params;
+        const { currentTime, newData = {}, options = {} } = req.body;
 
-    if (!currentTime) {
-        return res.status(400).json({ error: 'currentTime is required' });
-    }
-
-    // Add new data to patient history
-    if (Object.keys(newData).length > 0) {
-        PatientDataManager.addNewData(patientId, newData);
-    }
-    // console.log(newData)
-    // console.log(patients[patientId].history.glucose)
-    // Calculate basal recommendation
-    const result = calculateBasalForPatient(patientId, new Date(currentTime), options);
-
-    res.json({
-        patientId: patientId,
-        timestamp: currentTime,
-        suggestion: result.suggestion,
-        IIR: result.IIR,
-        context: {
-            iob: result.iob,
-            meal: result.meal,
-            glucose: result.glucoseStatus,
-            autosens: result.autosens ? {
-                ratio: result.autosens.ratio,
-                newISF: result.autosens.newisf,
-                originalISF: result.autosens.originalISF
-            } : null
-        },
-        diagnostics: {
-            stderrLog: result.stderrLog  // Include stderr output in response
+        if (!PatientDataManager.patientExists(patientId)) {
+            return res.status(404).json({ error: 'Patient not found' });
         }
-    });
 
-    //   } catch (error) {
-    //     res.status(500).json({ error: error.message });
-    //   }
+        if (!currentTime) {
+            return res.status(400).json({ error: 'currentTime is required' });
+        }
+
+        // Add new data to patient history
+        if (Object.keys(newData).length > 0) {
+            PatientDataManager.addNewData(patientId, newData);
+        }
+
+        // Calculate basal recommendation
+        const result = calculateBasalForPatient(patientId, new Date(currentTime), options);
+
+        res.json({
+            patientId: patientId,
+            timestamp: currentTime,
+            suggestion: result.suggestion,
+            IIR: result.IIR,
+            context: {
+                iob: result.iob,
+                meal: result.meal,
+                glucose: result.glucoseStatus,
+                autosens: result.autosens ? {
+                    ratio: result.autosens.ratio,
+                    newISF: result.autosens.newisf,
+                    originalISF: result.autosens.originalISF
+                } : null
+            },
+            diagnostics: {
+                stderrLog: result.stderrLog  // Include stderr output in response
+            }
+        });
+
+    } catch (error) {
+        res.status(500).json({ error: error.message, stack: error.stack });
+    }
 });
 
 // 3. Get Patient Status
@@ -774,7 +863,7 @@ app.post('/test/scenario/:patientId', (req, res) => {
                     });
 
                     // Calculate
-                    const result = calculateBasalForPatient(patientId, currentTime);
+                    const result = calculateBasalForPatient(patientId, new Date(currentTime));
                     results.push({
                         step: i + 1,
                         time: currentTime,
@@ -806,7 +895,7 @@ app.post('/test/scenario/:patientId', (req, res) => {
                         ]
                     });
 
-                    const result = calculateBasalForPatient(patientId, currentTime);
+                    const result = calculateBasalForPatient(patientId, new Date(currentTime));
                     results.push({
                         step: i + 1,
                         time: currentTime,
