@@ -28,8 +28,3 @@ package-lock.json
 
 bash-unit-test-temp
 
-CLAUDE.md
-.claude/
-.vscode/
-bin/
-logs/
