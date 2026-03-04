@@ -101,6 +101,7 @@
   "homepage": "https://github.com/openaps/oref0",
   "dependencies": {
     "express": "^5.1.0",
+    "get-intrinsic": "^1.3.0",
     "json": "^9.0.6",
     "json-stable-stringify": "^1.0.1",
     "lodash": "^4.17.15",
